@@ -29,6 +29,7 @@
 #include <arrow/builder.h>
 #include <arrow/type.h>
 #include <arrow/util/decimal.h>
+#include <arrow/extension_type.h>
 
 #define FOR_INTERNAL_NUMERIC_TYPES(M) \
         M(Int8, arrow::Int8Builder) \
@@ -68,6 +69,33 @@ namespace DB
         extern const int DECIMAL_OVERFLOW;
         extern const int ILLEGAL_COLUMN;
     }
+
+    class ArrowUUIDExtensionType : public arrow::ExtensionType
+    {
+    public:
+        ArrowUUIDExtensionType() : arrow::ExtensionType(arrow::fixed_size_binary(16)) {}
+
+        std::string extension_name() const override { return "arrow.uuid"; }
+
+        bool ExtensionEquals(const arrow::ExtensionType& other) const override
+        {
+            return other.extension_name() == this->extension_name();
+        }
+
+        std::shared_ptr<arrow::Array> MakeArray(std::shared_ptr<arrow::ArrayData> data) const override
+        {
+            return std::make_shared<arrow::ExtensionArray>(data);
+        }
+
+        arrow::Result<std::shared_ptr<arrow::DataType>> Deserialize(
+            std::shared_ptr<arrow::DataType> /* storage_type */,
+            const std::string& /* serialized_data */) const override
+        {
+            return std::make_shared<ArrowUUIDExtensionType>();
+        }
+
+        std::string Serialize() const override { return ""; }
+    };
 
     static const std::initializer_list<std::pair<String, std::shared_ptr<arrow::DataType>>> internal_type_to_arrow_type =
     {
@@ -1129,7 +1157,8 @@ namespace DB
             return arrow::uint32();
 
         if (isUUID(column_type))
-            return arrow::fixed_size_binary(sizeof(UUID));
+            return std::make_shared<ArrowUUIDExtensionType>();
+            //return arrow::fixed_size_binary(sizeof(UUID));
 
         if (isDate(column_type) && settings.output_date_as_uint16)
             return arrow::uint16();
@@ -1268,7 +1297,11 @@ namespace DB
                     column = recursiveRemoveLowCardinality(column);
 
                 std::unique_ptr<arrow::ArrayBuilder> array_builder;
-                arrow::Status status = MakeBuilder(arrow::default_memory_pool(), arrow_schema->field(static_cast<int>(column_i))->type(), &array_builder);
+                auto field_type = arrow_schema->field(static_cast<int>(column_i))->type();
+                if (field_type->id() == arrow::Type::EXTENSION)
+                    field_type = static_cast<arrow::ExtensionType *>(field_type.get())->storage_type();
+
+                arrow::Status status = MakeBuilder(arrow::default_memory_pool(), field_type, &array_builder);
                 checkStatus(status, column->getName(), format_name);
 
                 fillArrowArray(
@@ -1286,6 +1319,10 @@ namespace DB
                 std::shared_ptr<arrow::Array> arrow_array;
                 status = array_builder->Finish(&arrow_array);
                 checkStatus(status, column->getName(), format_name);
+
+                auto target_type = arrow_schema->field(static_cast<int>(column_i))->type();
+                if (target_type->id() == arrow::Type::EXTENSION)
+                    arrow_array = std::make_shared<arrow::ExtensionArray>(target_type, arrow_array);
 
                 table_data.at(column_i).emplace_back(std::move(arrow_array));
             }
